@@ -1,245 +1,239 @@
-import json
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta, date
 import plotly.express as px
 from sklearn.linear_model import LinearRegression
+from datetime import datetime, timedelta
+import json
 
-# ─── Page Config & Mobile CSS ────────────────────────────────────────
-st.set_page_config(page_title="Task Performance Dashboard", layout="wide")
-st.markdown("""
-<style>
-  .block-container { padding:0.5rem 1rem; font-family:'Inter',sans-serif }
-  .metric-card { background:#fff; border-radius:8px; padding:0.6rem;
-                 box-shadow:0 1px 3px rgba(0,0,0,0.1); text-align:center;
-                 margin:0.4rem 0; }
-  .metric-value { font-size:1.4rem; font-weight:bold; }
-  .metric-label { font-size:0.8rem; color:#555; }
-  /* scrollable tabs */
-  div[data-testid="stHorizontalBlock"] > div:first-child {
-    overflow-x:auto; white-space:nowrap;
-  }
-  div[data-testid="stHorizontalBlock"] > div:first-child > button {
-    flex:0 0 auto; min-width:100px;
-  }
-</style>
-""", unsafe_allow_html=True)
-
-# ─── Helpers ─────────────────────────────────────────────────────────
-@st.cache_data
-def load_csv(path):
-    return pd.read_csv(path)
-
-def find_and_rename(df, *keywords, new_name):
-    """If any column contains all keywords, rename it to new_name."""
-    for c in df.columns:
-        lc = c.lower()
-        if all(kw.lower() in lc for kw in keywords):
-            df.rename(columns={c: new_name}, inplace=True)
-            return True
-    return False
+# ─── Helper Functions ────────────────────────────────────────────────
+def load_csv(file):
+    """Load CSV file into a DataFrame."""
+    return pd.read_csv(file)
 
 def preprocess(df):
-    # 1) unify date columns
-    find_and_rename(df, 'end','date',            new_name='End date')
-    find_and_rename(df, 'date','completed',      new_name='Date completed')
-    find_and_rename(df, 'status',                new_name='Task status')
-
-    # 2) parse dates
-    if 'End date'       in df: df['End date']       = pd.to_datetime(df['End date'], errors='coerce')
-    if 'Date completed' in df: df['Date completed'] = pd.to_datetime(df['Date completed'], errors='coerce')
-
-    # 3) compute Days Before Due
-    today = pd.Timestamp.now().normalize()
-    if 'End date' in df and 'Date completed' in df:
-        df['Days Before Due'] = (df['End date'] - df['Date completed']).dt.days
-        missing = df['Date completed'].isna() & df['End date'].notna()
-        df.loc[missing, 'Days Before Due'] = -((df.loc[missing,'End date'] - today).dt.days)
-    else:
-        df['Days Before Due'] = np.nan
-
-    # 4) overdue flag
-    if 'End date' in df and 'Task status' in df:
-        df['Overdue'] = (df['End date'] < pd.Timestamp.now()) & (df['Task status'].str.lower()!='completed')
-    else:
-        df['Overdue'] = False
-
-    # 5) store & region defaults
-    df['Region'] = df.get('Level 1', pd.Series()).fillna('Unknown')
-    df['Store']  = df.get('Location name', pd.Series()).fillna('Unknown')
-    df = df[~df['Store'].isin(['JameTrade','Midwest'])]
-
-    # 6) Week Start
-    if 'End date' in df:
-        df['Week Start'] = df['End date'].dt.to_period('W').apply(lambda r:r.start_time)
-    else:
-        df['Week Start'] = pd.NaT
-
+    """Preprocess the DataFrame."""
+    df = df.copy()
+    # Rename columns for consistency
+    rename_map = {
+        'Location name': 'Store',
+        'Task name': 'Task',
+        'Task status_x': 'Status',
+        'End date': 'Due Date',
+        'Date completed': 'Completed Date'
+    }
+    df = df.rename(columns=rename_map)
+    
+    # Convert date columns to datetime
+    df['Due Date'] = pd.to_datetime(df['Due Date'], errors='coerce')
+    df['Completed Date'] = pd.to_datetime(df['Completed Date'], errors='coerce')
+    
+    # Calculate Days Before Due
+    current_date = pd.Timestamp.now()
+    df['Days Before Due'] = (df['Due Date'] - current_date).dt.total_seconds() / (24 * 3600)
+    df.loc[df['Status'] == 'Completed', 'Days Before Due'] = (
+        (df['Due Date'] - df['Completed Date']).dt.total_seconds() / (24 * 3600)
+    )
+    
     return df
 
 def metric_card(label, value, delta=None):
-    arrow = f" {'▲' if delta>0 else '▼'}{abs(delta):.0%}" if delta is not None else ""
-    color = "#2ca02c" if (delta or 0)>0 else "#d62728"
-    st.markdown(f"""
-      <div class='metric-card'>
-        <div class='metric-value'>{value}
-          <span style='color:{color};font-size:0.8rem'>{arrow}</span>
-        </div>
-        <div class='metric-label'>{label}</div>
-      </div>
-    """, unsafe_allow_html=True)
+    """Display a metric card with optional delta."""
+    delta_str = f"{delta:+.0%}" if delta is not None else None
+    st.metric(label, value, delta=delta_str)
 
 # ─── Sidebar / Upload ────────────────────────────────────────────────
 st.sidebar.header("Data & Filters")
 task_file = st.sidebar.file_uploader("➕ Task CSV", type="csv")
-kpi_file  = st.sidebar.file_uploader("📊 KPI CSV (optional)", type="csv")
+kpi_file = st.sidebar.file_uploader("📊 KPI CSV (optional)", type="csv")
+
 if not task_file:
-    st.sidebar.info("Upload your Task CSV to get started")
+    st.sidebar.info("Please upload your Task CSV to get started")
     st.stop()
 
-# ─── Load & Prep ─────────────────────────────────────────────────────
+# Load and preprocess data
 df = load_csv(task_file)
 df = preprocess(df)
-if kpi_file:
-    kpi = load_csv(kpi_file).rename(columns={'Location ID':'Location external ID'})
-    df = df.merge(kpi, on=['Location external ID','Store'], how='left')
 
-# ─── Week & Filters ──────────────────────────────────────────────────
-weeks = sorted(df['Week Start'].dropna().unique(), reverse=True)
-if not weeks:
-    st.error("No valid date data found. Check your headers.")
-    st.stop()
-labels = [f"{w.date()}–{(w+timedelta(days=6)).date()}" for w in weeks]
-sel    = st.sidebar.selectbox("Select Week", labels)
-start  = weeks[labels.index(sel)]
-wk     = df[df['Week Start']==start]
+# Load KPI data if provided
+kpi_df = load_csv(kpi_file) if kpi_file else None
 
-tasks  = sorted(wk['Task name'].unique())
-stores = sorted(wk['Store'].unique())
-sel_t  = st.sidebar.multiselect("Filter Tasks",  tasks, default=tasks)
-sel_s  = st.sidebar.multiselect("Filter Stores", stores)
-filtered = wk[wk['Task name'].isin(sel_t)]
-if sel_s:
-    filtered = filtered[filtered['Store'].isin(sel_s)]
+# ─── Main Layout ────────────────────────────────────────────────────
+st.title("Retail Task Dashboard")
+tab1, tab2, tab3 = st.tabs(["Overview", "Store Health", "Trends & Forecast"])
 
-# ─── Tabs ─────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-  "📊 Key Metrics & Recos",
-  "🏥 Store Health",
-  "🔮 Trends & Forecast",
-  "✅ Action Tracker"
-])
-
-# ─── Tab 1 ────────────────────────────────────────────────────────────
+# ─── Tab 1: Overview ────────────────────────────────────────────────
 with tab1:
-    st.header("Key Metrics")
-    total    = filtered['Task ID'].nunique()
-    on_time  = filtered.groupby('Task ID')['Days Before Due'].max().ge(0).sum()
-    avg_days = filtered.groupby('Task ID')['Days Before Due'].mean().mean().round(1)
-    overdue  = total - on_time
-    adhoc    = filtered.groupby('Task ID')['Store'].nunique().eq(1).sum()
-    avg_csat = filtered['CSAT Score'].mean() if 'CSAT Score' in filtered else None
-
-    prev     = df[df['Week Start']==start - timedelta(weeks=1)]
-    prev_on  = prev.groupby('Task ID')['Days Before Due'].max().ge(0).sum() if not prev.empty else None
-    delta    = None if prev_on is None else (on_time - prev_on)/prev_on
-
-    cols = st.columns(6)
-    with cols[0]: metric_card("Total Tasks", total)
-    with cols[1]: metric_card("% On Time", f"{on_time/total:.0%}", delta)
-    with cols[2]: metric_card("Avg Days +/- Due", f"{avg_days:.1f}")
-    with cols[3]: metric_card("Overdue Tasks", overdue)
-    with cols[4]: metric_card("Ad Hoc Tasks", adhoc)
-    if avg_csat is not None:
-        with cols[5]: metric_card("Avg CSAT", f"{avg_csat:.1f}")
-
-    st.markdown("### Top 5 Overdue Tasks")
-    over = (filtered.groupby('Task ID')
-              .agg(Store=('Store','first'),
-                   Task =('Task name','first'),
-                   DaysLate=('Days Before Due','max'))
-              .reset_index())
-    over = over[over['DaysLate']<0]
-    over['Days Late'] = -over['DaysLate']
-    st.table(over[['Store','Task ID','Task','Days Late']]
-             .sort_values('Days Late', ascending=False).head(5))
-
-    st.markdown("### Actionable Recommendations")
-    st.markdown("- Standardize break-fix tasks: build templates for those above.")
-    st.markdown("- Schedule weekly check-ins with store leads for overdue items.")
-    st.markdown("- Enable region managers to monitor their stores’ task boards.")
-
-# ─── Tab 2 ────────────────────────────────────────────────────────────
-with tab2:
-    st.header("Store Health Overview")
-    sb = (filtered.groupby('Store')
-          .agg(OnTimeRate=('Days Before Due', lambda x:(x>=0).mean()),
-               CSAT      =('CSAT Score','mean'),
-               Sales     =('Sales vs Target (%)','mean'),
-               TaskLoad  =('Task ID','nunique'))
-          .reset_index().fillna(0))
-    sb['HealthScore'] = (sb['OnTimeRate']*0.4 +
-                         (sb['CSAT']/100)*0.3 +
-                         (sb['Sales']/sb['Sales'].max())*0.2 +
-                         (1-sb['TaskLoad']/sb['TaskLoad'].max())*0.1)
-
-    # build region map once
-    def flatten(n,p,rows):
-        nm, tp = n['name'], n['type']
-        npath = p+[nm] if tp in ('REGION','COMPANY') else p
-        if tp=='STORE':
-            rows.append({'Store':nm,
-                         'Division':p[0] if len(p)>0 else 'Unknown',
-                         'Region':p[1]   if len(p)>1 else 'Unknown'})
-        for c in n.get('children',[]): flatten(c,npath,rows)
-
-    with open('region_hierarchy.json') as f: h=json.load(f)
-    rows=[]; flatten(h,[],rows)
-    map_df=pd.DataFrame(rows)
-
-    sb = sb.merge(map_df, on='Store', how='left')
-    sb[['Division','Region']] = sb[['Division','Region']].fillna('Unknown')
-    sb['TaskCount']=sb['TaskLoad']
-
-    fig=px.treemap(sb,
-        path=['Division','Region','Store'],
-        values='TaskCount',
-        color='HealthScore',
-        color_continuous_scale='RdYlGn',
-        hover_data=['HealthScore'],
-        title='Health by Region → Store'
+    st.header("Task Overview")
+    
+    # Task Status Distribution
+    status_counts = df.groupby(['Store', 'Status']).size().unstack(fill_value=0)
+    fig_status = px.bar(
+        status_counts,
+        x=status_counts.index,
+        y=status_counts.columns,
+        title="Task Status by Store",
+        labels={"value": "Number of Tasks", "Store": "Store"},
+        template="plotly_white"
     )
-    fig.update_layout(margin=dict(t=40,l=0,r=0,b=0))
-    st.plotly_chart(fig,use_container_width=True)
+    st.plotly_chart(fig_status, use_container_width=True)
+    
+    # Task Category Breakdown
+    category_counts = df.groupby(['Store', 'Task category']).size().unstack(fill_value=0)
+    fig_category = px.bar(
+        category_counts,
+        x=category_counts.index,
+        y=category_counts.columns,
+        title="Task Categories by Store",
+        labels={"value": "Number of Tasks", "Store": "Store"},
+        template="plotly_white"
+    )
+    st.plotly_chart(fig_category, use_container_width=True)
+
+# ─── Tab 2: Store Health ────────────────────────────────────────────
+with tab2:
+    st.header("Store Health")
+    
+    # Calculate on-time completion rate
+    health_data = (
+        df.groupby('Store')
+          .agg(OnTimeRate=('Days Before Due', lambda x: (x >= 0).mean() if not x.empty else 0))
+          .reset_index()
+    )
+    
+    # Merge with KPI data if available
+    if kpi_df is not None:
+        kpi_health = kpi_df.groupby('Store').agg({
+            'Sales vs Target': 'mean',
+            'CSAT': 'mean'
+        }).reset_index()
+        health_data = health_data.merge(kpi_health, on='Store', how='left')
+        health_data['Health Score'] = (
+            health_data['OnTimeRate'] * 0.4 +
+            health_data['Sales vs Target'].fillna(0) * 0.3 +
+            health_data['CSAT'].fillna(0) * 0.3
+        )
+    else:
+        health_data['Health Score'] = health_data['OnTimeRate']
+    
+    # Health Score Visualization
+    fig_health = px.bar(
+        health_data,
+        x='Store',
+        y='Health Score',
+        title="Store Health Scores",
+        labels={"Health Score": "Health Score"},
+        template="plotly_white",
+        color='Health Score',
+        color_continuous_scale='RdYlGn'
+    )
+    st.plotly_chart(fig_health, use_container_width=True)
+    
+    # Hierarchy Visualization
+    hierarchy_cols = [col for col in df.columns if col.startswith('Level')]
+    if hierarchy_cols:
+        hierarchy_data = df[hierarchy_cols + ['Store', 'Health Score']].drop_duplicates()
+        fig_hierarchy = px.treemap(
+            hierarchy_data,
+            path=hierarchy_cols + ['Store'],
+            values='Health Score',
+            title="Health Score by Hierarchy",
+            color='Health Score',
+            color_continuous_scale='RdYlGn'
+        )
+        st.plotly_chart(fig_hierarchy, use_container_width=True)
 
 # ─── Tab 3: Trends & Forecast ────────────────────────────────────────
 with tab3:
-    st.header("Weekly Compliance Trend")
+    st.header("Trends & Predictive Insights")
+    
+    # Weekly On-Time Rate Trend
+    st.subheader("Historical On-Time Rate")
+    df['Week Start'] = pd.to_datetime(df['Due Date']).dt.to_period('W').apply(lambda r: r.start_time)
     trend = (
         df.groupby('Week Start')
-          .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max().ge(0).mean())
+          .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max().ge(0).mean() if not d.empty else 0)
           .rename("OnTimeRate")
           .reset_index()
           .sort_values('Week Start')
     )
-    st.line_chart(trend.set_index('Week Start')['OnTimeRate'])
-
-    st.subheader("Forecasted On-Time Rate Next Week")
-    x = np.arange(len(trend)).reshape(-1,1); y = trend['OnTimeRate']
-    if len(trend)>1:
-        model = LinearRegression().fit(x, y); pred = model.predict([[len(trend)]])[0]
-        st.metric("Forecasted On-Time %", f"{pred:.0%}")
-
-    st.subheader("Upcoming Effort Requirement")
-    base_rate = pred if len(trend)>1 else y.iloc[-1]
-    fut = (filtered.groupby('Store')['Expected duration'].sum() * (1 - base_rate))
-    st.bar_chart(fut.reset_index(name='Required Effort (hrs)').set_index('Store')['Required Effort (hrs)'])
-
-# ─── Tab 4: Action & Accountability Tracker ─────────────────────────
-with tab4:
-    st.header("Action & Accountability Tracker")
-    actions = over[['Store','Task ID','Task','Days Late']].copy()
-    actions['Next Action Date'] = date.today() + timedelta(days=2)
-    actions['Owner'] = "Store Manager"
-    st.table(actions)
+    fig_trend = px.line(
+        trend,
+        x='Week Start',
+        y='OnTimeRate',
+        title="Weekly On-Time Rate Trend",
+        labels={"OnTimeRate": "On-Time Rate (%)"},
+        template="plotly_white"
+    )
+    fig_trend.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig_trend, use_container_width=True)
+    
+    if trend.empty:
+        st.warning("No completed tasks to establish a trend. Predictions will assume current overdue status.")
+    
+    # Forecast On-Time Rate for Next Week
+    st.subheader("Forecasted On-Time Rate (Next Week)")
+    x = np.arange(len(trend)).reshape(-1, 1)
+    y = trend['OnTimeRate']
+    if len(trend) > 1:
+        model = LinearRegression().fit(x, y)
+        pred = model.predict([[len(trend)]])[0]
+        pred = max(0, min(1, pred))
+        prev_rate = y.iloc[-1] if not y.empty else 0
+        delta = pred - prev_rate
+        metric_card("Forecasted On-Time Rate", f"{pred:.0%}", delta)
+    else:
+        current_overdue = (pd.to_datetime(df['Due Date']) < pd.Timestamp.now()).mean()
+        pred = 1 - current_overdue
+        metric_card("Forecasted On-Time Rate", f"{pred:.0%}", None)
+    
+    # Store-Specific Completion Rate Forecast
+    st.subheader("Store-Specific Completion Rate Forecast")
+    store_trends = (
+        df.groupby(['Week Start', 'Store'])
+          .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max().ge(0).mean() if not d.empty else 0)
+          .rename("OnTimeRate")
+          .reset_index()
+    )
+    forecast_data = []
+    for store in store_trends['Store'].unique():
+        store_data = store_trends[store_trends['Store'] == store]
+        if len(store_data) > 1:
+            x_store = np.arange(len(store_data)).reshape(-1, 1)
+            y_store = store_data['OnTimeRate']
+            model_store = LinearRegression().fit(x_store, y_store)
+            pred_store = model_store.predict([[len(store_data)]])[0]
+            forecast_data.append({
+                "Store": store,
+                "Forecasted On-Time Rate": max(0, min(1, pred_store))
+            })
+        else:
+            store_tasks = df[df['Store'] == store]
+            current_overdue = (pd.to_datetime(store_tasks['Due Date']) < pd.Timestamp.now()).mean()
+            pred_store = 1 - current_overdue
+            forecast_data.append({"Store": store, "Forecasted On-Time Rate": pred_store})
+    
+    forecast_df = pd.DataFrame(forecast_data)
+    fig_store = px.bar(
+        forecast_df,
+        x='Store',
+        y='Forecasted On-Time Rate',
+        title="Predicted On-Time Rate by Store (Next Week)",
+        labels={"Forecasted On-Time Rate": "On-Time Rate (%)"},
+        template="plotly_white"
+    )
+    fig_store.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig_store, use_container_width=True)
+    
+    # Health Score Forecast
+    st.subheader("Forecasted Store Health Scores")
+    health_data = (
+        df.groupby(['Week Start', 'Store'])
+          .agg(OnTimeRate=('Days Before Due', lambda x: (x >= 0).mean() if not x.empty else 0))
+          .reset_index()
+    )
+    health_forecast = []
+    for store in health_data['Store'].unique():
+        store_health = health_data[health_data['Store'] == store]
+        if len(store_health) > 1:
+            x_health = np.arange(len(store

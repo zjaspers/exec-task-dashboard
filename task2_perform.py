@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from io import StringIO
 
 # ─── Custom CSS for Cal AI-Inspired UI ───────────────────────────────
 st.markdown("""
@@ -54,6 +56,7 @@ st.markdown("""
         h2, h3 { font-size: 1rem; }
         .stMetric { font-size: 0.9rem; }
         .stButton > button { width: 100%; }
+        .stPlotlyChart { height: 300px !important; }
     }
     </style>
 """, unsafe_allow_html=True)
@@ -62,6 +65,36 @@ st.markdown("""
 def load_csv(file):
     """Load CSV file into a DataFrame."""
     return pd.read_csv(file)
+
+def load_xml(file, root_tag, ns):
+    """Load XML file into a DataFrame."""
+    tree = ET.parse(file)
+    root = tree.getroot()
+    data = []
+    
+    for elem in root.findall(f'./{ns}{root_tag}', {'x': ns}):
+        record = {}
+        for child in elem:
+            tag = child.tag.replace(f'{{{ns}}}', '')
+            if tag == 'descriptions':
+                for desc in child:
+                    if desc.attrib.get('lang') == 'en':
+                        record['description'] = desc.text
+            elif tag == 'ipMasks':
+                record['ipMaskAddress'] = [ip.text for ip in child]
+            elif tag == 'geolocationConfigs':
+                record['geolocationConfigs'] = [(g.find(f'./{ns}latitude', {'x': ns}).text,
+                                                g.find(f'./{ns}longitude', {'x': ns}).text,
+                                                g.find(f'./{ns}radius', {'x': ns}).text)
+                                               for g in child]
+            elif tag == 'telephone':
+                record['telephone'] = child.text
+                record['telephone_type'] = child.attrib.get('type')
+            else:
+                record[tag] = child.text
+        data.append(record)
+    
+    return pd.DataFrame(data)
 
 def preprocess_tasks(df):
     """Preprocess task DataFrame."""
@@ -195,17 +228,20 @@ def forecast_completion(task_data, kpi_data=None):
     
     return pd.DataFrame(forecast_data)
 
-def generate_recommendations(task_data, kpi_data, forecast_df, health_data):
+def generate_recommendations(task_data, kpi_data, forecast_df, health_data, positions_df, locations_df):
     """Generate specific, actionable recommendations."""
     recommendations = []
     current_date = pd.Timestamp.now()
+    
+    location_region_map = locations_df.set_index('locationName')['region'].to_dict()
     
     overdue_tasks = task_data[task_data['Is Overdue']]
     if not overdue_tasks.empty:
         overdue_by_store = overdue_tasks.groupby('Store').agg({
             'Task': 'count',
             'Task category': lambda x: x.mode().iloc[0] if not x.empty and not x.isna().all() else 'Unknown',
-            'Assignee': lambda x: x.mode().iloc[0] if not x.empty and not x.isna().all() and not x.mode().empty else None
+            'Assignee': lambda x: x.mode().iloc[0] if not x.empty and not x.isna().all() and not x.mode().empty else None,
+            'Priority': lambda x: 'HIGH' if 'HIGH' in x.values else 'MEDIUM' if 'MEDIUM' in x.values else 'LOW'
         }).reset_index().rename(columns={'Task': 'Overdue Count'})
         
         for _, row in overdue_by_store.iterrows():
@@ -213,12 +249,16 @@ def generate_recommendations(task_data, kpi_data, forecast_df, health_data):
             task_category = row['Task category'].lower()
             overdue_count = row['Overdue Count']
             assignee = row['Assignee']
+            priority = row['Priority']
+            
+            target_role = 'Store Manager' if priority == 'HIGH' or overdue_count > 3 else 'Sales Associate'
+            target_role_id = positions_df[positions_df['description'] == target_role]['employeePositionId'].iloc[0] if target_role in positions_df['description'].values else '001'
             
             if overdue_count > 3:
                 if assignee is None:
                     recommendations.append(
                         f"- **Visit {store}**: {overdue_count} {task_category} tasks are overdue with no assignee. "
-                        f"Assign to the store manager and clear the backlog by {current_date + timedelta(days=3):%b %d}."
+                        f"Assign to {target_role} (ID: {target_role_id}) by {current_date + timedelta(days=3):%b %d}."
                     )
                 else:
                     recommendations.append(
@@ -229,11 +269,11 @@ def generate_recommendations(task_data, kpi_data, forecast_df, health_data):
             if assignee is None:
                 recommendations.append(
                     f"- **Assign Task**: {overdue_count} overdue {task_category} tasks at {store} lack an assignee. "
-                    f"Assign to a Site Coach by {current_date + timedelta(days=2):%b %d}."
+                    f"Assign to {target_role} (ID: {target_role_id}) by {current_date + timedelta(days=2):%b %d}."
                 )
             else:
                 recommendations.append(
-                    f"- **Reassign Task**: Move overdue {task_category} tasks at {store} to a Site Coach."
+                    f"- **Reassign Task**: Move overdue {task_category} tasks at {store} to {target_role} (ID: {target_role_id})."
                 )
     
     if kpi_data is not None:
@@ -249,29 +289,29 @@ def generate_recommendations(task_data, kpi_data, forecast_df, health_data):
                 store_tasks = task_data[task_data['Store'] == store]
                 if store_tasks['Is Overdue'].mean() > 0.2:
                     recommendations.append(
-                        f"- **Add Training at {store}**: Low CSAT ({kpi_data[kpi_data['Store'] == store]['CSAT'].iloc[0]:.1f}) "
-                        f"may be due to poor task compliance. Assign a customer service training module by {current_date + timedelta(days=5):%b %d}."
+                        f"- **Add Training at {store}**: Low CSAT ({kpi_data[kpi_data['Store'] == store]['CSAT'].iloc[0]:.1f}). "
+                        f"Assign customer service training to Sales Associates (ID: 001) by {current_date + timedelta(days=5):%b %d}."
                     )
             
             low_sales = kpi_data[kpi_data['Sales vs Target'] < 0]['Store'].tolist()
             for store in low_sales:
                 recommendations.append(
                     f"- **Assign Planogram Task at {store}**: Sales are at {kpi_data[kpi_data['Store'] == store]['Sales vs Target'].iloc[0]}% of target. "
-                    f"Add a new planogram reset task to boost displays by {current_date + timedelta(days=7):%b %d}."
+                    f"Add a planogram reset task to Sales Associates (ID: 001) by {current_date + timedelta(days=7):%b %d}."
                 )
             
             low_cleanliness = kpi_data[kpi_data['Cleanliness Score'] < 70]['Store'].tolist()
             for store in low_cleanliness:
                 recommendations.append(
                     f"- **Schedule Cleaning Task at {store}**: Low cleanliness score ({kpi_data[kpi_data['Store'] == store]['Cleanliness Score'].iloc[0]:.1f}). "
-                    f"Assign a cleaning audit task to the store manager by {current_date + timedelta(days=4):%b %d}."
+                    f"Assign a cleaning audit task to Store Manager (ID: 003) by {current_date + timedelta(days=4):%b %d}."
                 )
     
     high_risk = forecast_df[forecast_df['Risk Level'] == 'High']['Store'].tolist()
     for store in high_risk:
-        region = task_data[task_data['Store'] == store]['Level 2'].iloc[0] if 'Level 2' in task_data.columns else 'Unknown'
+        region = location_region_map.get(store, 'Unknown')
         recommendations.append(
-            f"- **Alert {region} Manager**: {store} is at high risk of missing task deadlines next week. "
+            f"- **Alert Region Manager (ID: 009) for {region}**: {store} is at high risk of missing task deadlines next week. "
             f"Add labor or reassign high-priority tasks by {current_date + timedelta(days=2):%b %d}."
         )
     
@@ -288,11 +328,14 @@ st.markdown("Track tasks, boost KPIs, and keep stores thriving. Upload your data
 
 # Upload Section
 with st.expander("📂 Upload Data", expanded=True):
-    col1, col2 = st.columns([1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
         task_file = st.file_uploader("Task CSV", type="csv", help="Upload better_task_report_full.csv")
     with col2:
         kpi_file = st.file_uploader("KPI CSV (optional)", type="csv", help="Upload better_store_kpis.csv")
+    with col3:
+        positions_file = st.file_uploader("Positions XML", type="xml", help="Upload employeepositionsforGPT.xml")
+        locations_file = st.file_uploader("Locations XML", type="xml", help="Upload locationsforGPT.xml")
     
     if not task_file:
         st.info("Please upload a Task CSV to continue.")
@@ -301,6 +344,50 @@ with st.expander("📂 Upload Data", expanded=True):
 # Load and Preprocess Data
 task_data = preprocess_tasks(load_csv(task_file))
 kpi_data = load_csv(kpi_file) if kpi_file else None
+
+# Load XML data (default to sample data if not uploaded)
+if positions_file:
+    positions_df = load_xml(positions_file, 'employeePosition', 'urn:employeePositions')
+else:
+    positions_xml = """
+    <?xml version="1.0"?>
+    <x:employeePositions xmlns:x="urn:employeePositions">
+        <x:employeePosition>
+            <employeePositionId>001</employeePositionId>
+            <descriptions><description lang="en">Sales Associate</description></descriptions>
+        </x:employeePosition>
+        <x:employeePosition>
+            <employeePositionId>003</employeePositionId>
+            <descriptions><description lang="en">Store Manager</description></descriptions>
+        </x:employeePosition>
+        <x:employeePosition>
+            <employeePositionId>009</employeePositionId>
+            <descriptions><description lang="en">Region Manager</description></descriptions>
+        </x:employeePosition>
+    </x:employeePositions>
+    """
+    positions_df = load_xml(StringIO(positions_xml), 'employeePosition', 'urn:employeePositions')
+
+if locations_file:
+    locations_df = load_xml(locations_file, 'location', 'urn:locations')
+else:
+    locations_xml = """
+    <?xml version="1.0"?>
+    <x:locations xmlns:x="urn:locations">
+        <x:location>
+            <locationId>30477</locationId>
+            <locationName>Aurora</locationName>
+            <region>us-co</region>
+        </x:location>
+        <x:location>
+            <locationId>10403</locationId>
+            <locationName>La Plaza</locationName>
+            <region>us-tx</region>
+        </x:location>
+    </x:locations>
+    """
+    locations_df = load_xml(StringIO(locations_xml), 'location', 'urn:locations')
+
 health_data = calculate_health_score(task_data, kpi_data)
 forecast_df = forecast_completion(task_data, kpi_data)
 
@@ -381,7 +468,7 @@ with st.expander("🔮 Next Week’s Outlook", expanded=False):
 # Recommendations Section
 with st.expander("✅ Smart Recommendations", expanded=True):
     st.subheader("What to Do Next")
-    recommendations = generate_recommendations(task_data, kpi_data, forecast_df, health_data)
+    recommendations = generate_recommendations(task_data, kpi_data, forecast_df, health_data, positions_df, locations_df)
     for rec in recommendations:
         st.markdown(rec)
 
@@ -391,25 +478,74 @@ tab1, tab2 = st.tabs(["By Store", "By Task"])
 
 with tab1:
     st.subheader("Store Performance Details")
+    current_date = pd.Timestamp.now()
+    
     for store in health_data['Store']:
         with st.expander(f"{store} Details"):
             store_tasks = task_data[task_data['Store'] == store]
             store_health = health_data[health_data['Store'] == store].iloc[0]
             
+            # Store Information
+            st.markdown("**Store Information**")
+            store_info = locations_df[locations_df['locationName'] == store].iloc[0] if store in locations_df['locationName'].values else None
+            if store_info is not None:
+                address = f"{store_info['address1']}, {store_info.get('address2', '')}, {store_info['city']}, {store_info['region']}, {store_info['zipCode']}"
+                st.write({
+                    'Address': address.strip(', '),
+                    'Region': store_info['region'],
+                    'Contact': store_info['telephone']
+                })
+            else:
+                st.write("Store location data not available.")
+            
+            # Key Metrics
+            st.markdown("**Key Metrics**")
             col1, col2 = st.columns([1, 1])
             col1.metric("Compliance Rate", f"{store_health['ComplianceRate']:.0%}")
             col2.metric("Health Score", f"{store_health['Health Score']:.0%}")
             
+            # Available Roles
+            st.markdown("**Available Roles**")
+            location_roles = positions_df[positions_df['locationType'] == 'LOCATION']['description'].tolist()
+            st.write(", ".join(location_roles) if location_roles else "No location-specific roles available.")
+            
+            # Overdue Tasks
             overdue_tasks = store_tasks[store_tasks['Is Overdue']]
             if not overdue_tasks.empty:
-                st.markdown("**Overdue Tasks**:")
-                overdue_summary = overdue_tasks.groupby(['Task', 'Task category', 'Priority', 'Assignee']).size().reset_index(name='Steps Overdue')
-                st.dataframe(overdue_summary[['Task', 'Task category', 'Priority', 'Assignee', 'Steps Overdue']])
+                st.markdown("**Overdue Tasks**")
+                overdue_summary = overdue_tasks.groupby(['Task', 'Task category', 'Priority', 'Assignee']).agg({
+                    'Days Overdue': 'mean'
+                }).reset_index().rename(columns={'Days Overdue': 'Avg Days Overdue'})
+                overdue_summary['Avg Days Overdue'] = overdue_summary['Avg Days Overdue'].round(1)
+                overdue_summary['Assignee'] = overdue_summary['Assignee'].fillna('Unassigned')
+                st.dataframe(overdue_summary[['Task', 'Task category', 'Priority', 'Assignee', 'Avg Days Overdue']])
+                
+                # Chart: Overdue Tasks by Category
+                overdue_by_category = overdue_tasks.groupby('Task category').size().reset_index(name='Count')
+                fig_overdue = px.bar(
+                    overdue_by_category,
+                    x='Task category',
+                    y='Count',
+                    title="Overdue Tasks by Category",
+                    template="plotly_white",
+                    color='Task category',
+                    color_discrete_sequence=['#E53935', '#1E88E5', '#43A047']
+                )
+                st.plotly_chart(fig_overdue, use_container_width=True)
+                
+                # Assignment Suggestions
+                st.markdown("**Assignment Suggestions**")
+                for _, row in overdue_summary.iterrows():
+                    if row['Assignee'] == 'Unassigned':
+                        target_role = 'Store Manager' if row['Priority'] == 'HIGH' else 'Sales Associate'
+                        target_role_id = positions_df[positions_df['description'] == target_role]['employeePositionId'].iloc[0] if target_role in positions_df['description'].values else '001'
+                        st.markdown(f"- Assign '{row['Task']}' to {target_role} (ID: {target_role_id}) by {current_date + timedelta(days=2):%b %d}.")
             
+            # KPIs and Insights
             if kpi_data is not None and store in kpi_data['Store'].values:
                 is_valid, _ = validate_kpi_data(kpi_data)
                 if is_valid:
-                    st.markdown("**KPIs**:")
+                    st.markdown("**KPIs**")
                     store_kpis = kpi_data[kpi_data['Store'] == store].rename(columns={
                         'Sales vs Target (%)': 'Sales vs Target',
                         'CSAT Score': 'CSAT',
@@ -420,6 +556,14 @@ with tab1:
                         'CSAT': f"{store_kpis['CSAT']:.1f}",
                         'Cleanliness Score': f"{store_kpis['Cleanliness Score']:.1f}"
                     })
+                    
+                    st.markdown("**KPI Insights**")
+                    if store_kpis['CSAT'] < 70:
+                        st.markdown(f"- Low CSAT ({store_kpis['CSAT']:.1f}): Assign customer service training to Sales Associates (ID: 001) by {current_date + timedelta(days=5):%b %d}.")
+                    if store_kpis['Sales vs Target'] < 0:
+                        st.markdown(f"- Low Sales ({store_kpis['Sales vs Target']}% of target): Add a planogram reset task to Sales Associates (ID: 001) by {current_date + timedelta(days=7):%b %d}.")
+                    if store_kpis['Cleanliness Score'] < 70:
+                        st.markdown(f"- Low Cleanliness ({store_kpis['Cleanliness Score']:.1f}): Assign a cleaning audit task to Store Manager (ID: 003) by {current_date + timedelta(days=4):%b %d}.")
 
 with tab2:
     st.subheader("Task Compliance Across Stores")
@@ -445,7 +589,7 @@ with tab2:
     fig_task.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig_task, use_container_width=True)
     
-    st.markdown("**Task Details**:")
+    st.markdown("**Task Details**")
     task_details = task_data[task_data['Task'] == selected_task][['Task category', 'Priority', 'Assignee']].iloc[0]
     st.write({
         'Category': task_details['Task category'],

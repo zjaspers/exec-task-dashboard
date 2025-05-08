@@ -94,14 +94,22 @@ def validate_kpi_data(kpi_data):
     if kpi_data is None:
         return False, "KPI data is missing."
     
-    required_columns = ['Store', 'Sales vs Target', 'CSAT', 'Inventory Turnover', 'Shrinkage Rate', 'Employee Engagement']
-    missing_columns = [col for col in required_columns if col not in kpi_data.columns]
+    column_mapping = {
+        'Store': 'Store',
+        'Sales vs Target': 'Sales vs Target (%)',
+        'CSAT': 'CSAT Score',
+        'Cleanliness Score': 'Cleanliness Score'
+    }
+    required_columns = ['Store', 'Sales vs Target', 'CSAT', 'Cleanliness Score']
+    actual_columns = [column_mapping[col] for col in required_columns if col in column_mapping]
+    missing_columns = [col for col in actual_columns if col not in kpi_data.columns]
+    
     if missing_columns:
         return False, f"KPI data is missing columns: {', '.join(missing_columns)}."
     
-    numeric_columns = ['Sales vs Target', 'CSAT', 'Inventory Turnover', 'Shrinkage Rate', 'Employee Engagement']
+    numeric_columns = ['Sales vs Target (%)', 'CSAT Score', 'Cleanliness Score']
     for col in numeric_columns:
-        if not pd.api.types.is_numeric_dtype(kpi_data[col]):
+        if col in kpi_data.columns and not pd.api.types.is_numeric_dtype(kpi_data[col]):
             return False, f"Column '{col}' must be numeric."
     
     return True, ""
@@ -122,21 +130,23 @@ def calculate_health_score(task_data, kpi_data=None):
         is_valid, error_msg = validate_kpi_data(kpi_data)
         if is_valid:
             try:
+                kpi_data = kpi_data.rename(columns={
+                    'Sales vs Target (%)': 'Sales vs Target',
+                    'CSAT Score': 'CSAT',
+                    'Cleanliness Score': 'Cleanliness Score'
+                })
                 kpi_health = kpi_data.groupby('Store').agg({
                     'Sales vs Target': 'mean',
                     'CSAT': 'mean',
-                    'Inventory Turnover': 'mean',
-                    'Shrinkage Rate': 'mean',
-                    'Employee Engagement': 'mean'
+                    'Cleanliness Score': 'mean'
                 }).reset_index()
                 compliance_data = compliance_data.merge(kpi_health, on='Store', how='left')
+                
                 compliance_data['Health Score'] = (
-                    (compliance_data['ComplianceRate'] * 0.4) +
-                    (compliance_data['Sales vs Target'].fillna(50) / 100 * 0.2) +
-                    (compliance_data['CSAT'].fillna(3) / 5 * 0.15) +
-                    ((compliance_data['Inventory Turnover'].fillna(5) / 10) * 0.1) +
-                    ((1 - compliance_data['Shrinkage Rate'].fillna(2) / 100) * 0.1) +
-                    (compliance_data['Employee Engagement'].fillna(50) / 100 * 0.05)
+                    (compliance_data['ComplianceRate'] * 0.5) +
+                    (compliance_data['Sales vs Target'].fillna(0) / 100 * 0.2) +
+                    (compliance_data['CSAT'].fillna(50) / 100 * 0.2) +
+                    (compliance_data['Cleanliness Score'].fillna(50) / 100 * 0.1)
                 )
             except Exception as e:
                 st.warning(f"Error processing KPI data: {str(e)}. Using compliance data only.")
@@ -164,12 +174,17 @@ def forecast_completion(task_data, kpi_data=None):
         if kpi_data is not None and store in kpi_data['Store'].values:
             is_valid, _ = validate_kpi_data(kpi_data)
             if is_valid:
-                kpi_row = kpi_data[kpi_data['Store'] == store].iloc[0]
-                pred *= min(1.2, max(0.8, kpi_row['Employee Engagement'] / 100))
-                if kpi_row['CSAT'] < 4.0:
+                kpi_row = kpi_data[kpi_data['Store'] == store].rename(columns={
+                    'Sales vs Target (%)': 'Sales vs Target',
+                    'CSAT Score': 'CSAT',
+                    'Cleanliness Score': 'Cleanliness Score'
+                }).iloc[0]
+                if kpi_row['CSAT'] < 70:
                     pred *= 0.9
-                if kpi_row['Shrinkage Rate'] > 2.0:
+                if kpi_row['Cleanliness Score'] < 70:
                     pred *= 0.95
+                if kpi_row['Sales vs Target'] < 0:
+                    pred *= 0.9
         
         risk_level = 'High' if pred < 0.5 else 'Medium' if pred < 0.75 else 'Low'
         forecast_data.append({
@@ -186,26 +201,50 @@ def generate_recommendations(task_data, kpi_data, forecast_df, health_data):
     current_date = pd.Timestamp.now()
     
     overdue_tasks = task_data[task_data['Is Overdue']]
-    overdue_by_store = overdue_tasks.groupby('Store').agg({
-        'Task': 'count',
-        'Task category': lambda x: x.mode().iloc[0] if not x.empty else 'Unknown',
-        'Assignee': lambda x: x.mode().iloc[0] if not x.empty else 'Unassigned'
-    }).reset_index().rename(columns={'Task': 'Overdue Count'})
-    
-    for _, row in overdue_by_store.iterrows():
-        if row['Overdue Count'] > 3:
-            recommendations.append(
-                f"- **Visit {row['Store']}**: {row['Overdue Count']} {row['Task category'].lower()} tasks are overdue. "
-                f"Check with {row['Assignee']} to clear the backlog by {current_date + timedelta(days=3):%b %d}."
-            )
-        recommendations.append(
-            f"- **Reassign Task**: Move overdue {row['Task category'].lower()} tasks at {row['Store']} to a Site Coach."
-        )
+    if not overdue_tasks.empty:
+        overdue_by_store = overdue_tasks.groupby('Store').agg({
+            'Task': 'count',
+            'Task category': lambda x: x.mode().iloc[0] if not x.empty and not x.isna().all() else 'Unknown',
+            'Assignee': lambda x: x.mode().iloc[0] if not x.empty and not x.isna().all() and not x.mode().empty else None
+        }).reset_index().rename(columns={'Task': 'Overdue Count'})
+        
+        for _, row in overdue_by_store.iterrows():
+            store = row['Store']
+            task_category = row['Task category'].lower()
+            overdue_count = row['Overdue Count']
+            assignee = row['Assignee']
+            
+            if overdue_count > 3:
+                if assignee is None:
+                    recommendations.append(
+                        f"- **Visit {store}**: {overdue_count} {task_category} tasks are overdue with no assignee. "
+                        f"Assign to the store manager and clear the backlog by {current_date + timedelta(days=3):%b %d}."
+                    )
+                else:
+                    recommendations.append(
+                        f"- **Visit {store}**: {overdue_count} {task_category} tasks are overdue. "
+                        f"Check with {assignee} to clear the backlog by {current_date + timedelta(days=3):%b %d}."
+                    )
+            
+            if assignee is None:
+                recommendations.append(
+                    f"- **Assign Task**: {overdue_count} overdue {task_category} tasks at {store} lack an assignee. "
+                    f"Assign to a Site Coach by {current_date + timedelta(days=2):%b %d}."
+                )
+            else:
+                recommendations.append(
+                    f"- **Reassign Task**: Move overdue {task_category} tasks at {store} to a Site Coach."
+                )
     
     if kpi_data is not None:
         is_valid, _ = validate_kpi_data(kpi_data)
         if is_valid:
-            low_csat = kpi_data[kpi_data['CSAT'] < 4.0]['Store'].tolist()
+            kpi_data = kpi_data.rename(columns={
+                'Sales vs Target (%)': 'Sales vs Target',
+                'CSAT Score': 'CSAT',
+                'Cleanliness Score': 'Cleanliness Score'
+            })
+            low_csat = kpi_data[kpi_data['CSAT'] < 70]['Store'].tolist()
             for store in low_csat:
                 store_tasks = task_data[task_data['Store'] == store]
                 if store_tasks['Is Overdue'].mean() > 0.2:
@@ -214,30 +253,23 @@ def generate_recommendations(task_data, kpi_data, forecast_df, health_data):
                         f"may be due to poor task compliance. Assign a customer service training module by {current_date + timedelta(days=5):%b %d}."
                     )
             
-            low_sales = kpi_data[kpi_data['Sales vs Target'] < 90]['Store'].tolist()
+            low_sales = kpi_data[kpi_data['Sales vs Target'] < 0]['Store'].tolist()
             for store in low_sales:
                 recommendations.append(
                     f"- **Assign Planogram Task at {store}**: Sales are at {kpi_data[kpi_data['Store'] == store]['Sales vs Target'].iloc[0]}% of target. "
                     f"Add a new planogram reset task to boost displays by {current_date + timedelta(days=7):%b %d}."
                 )
             
-            high_shrinkage = kpi_data[kpi_data['Shrinkage Rate'] > 2.0]['Store'].tolist()
-            for store in high_shrinkage:
+            low_cleanliness = kpi_data[kpi_data['Cleanliness Score'] < 70]['Store'].tolist()
+            for store in low_cleanliness:
                 recommendations.append(
-                    f"- **Schedule Inventory Audit at {store}**: High shrinkage ({kpi_data[kpi_data['Store'] == store]['Shrinkage Rate'].iloc[0]:.1f}%). "
-                    f"Assign an inventory audit task to the store manager by {current_date + timedelta(days=4):%b %d}."
-                )
-            
-            low_engagement = kpi_data[kpi_data['Employee Engagement'] < 70]['Store'].tolist()
-            for store in low_engagement:
-                recommendations.append(
-                    f"- **Message {store} Manager**: Low employee engagement ({kpi_data[kpi_data['Store'] == store]['Employee Engagement'].iloc[0]}%). "
-                    f"Assign a team-building learning module or schedule a check-in by {current_date + timedelta(days=3):%b %d}."
+                    f"- **Schedule Cleaning Task at {store}**: Low cleanliness score ({kpi_data[kpi_data['Store'] == store]['Cleanliness Score'].iloc[0]:.1f}). "
+                    f"Assign a cleaning audit task to the store manager by {current_date + timedelta(days=4):%b %d}."
                 )
     
     high_risk = forecast_df[forecast_df['Risk Level'] == 'High']['Store'].tolist()
     for store in high_risk:
-        region = task_data[task_data['Store'] == store]['Level 2'].iloc[0]
+        region = task_data[task_data['Store'] == store]['Level 2'].iloc[0] if 'Level 2' in task_data.columns else 'Unknown'
         recommendations.append(
             f"- **Alert {region} Manager**: {store} is at high risk of missing task deadlines next week. "
             f"Add labor or reassign high-priority tasks by {current_date + timedelta(days=2):%b %d}."
@@ -260,7 +292,7 @@ with st.expander("📂 Upload Data", expanded=True):
     with col1:
         task_file = st.file_uploader("Task CSV", type="csv", help="Upload better_task_report_full.csv")
     with col2:
-        kpi_file = st.file_uploader("KPI CSV (optional)", type="csv", help="Upload store KPIs (Sales, CSAT, etc.)")
+        kpi_file = st.file_uploader("KPI CSV (optional)", type="csv", help="Upload better_store_kpis.csv")
     
     if not task_file:
         st.info("Please upload a Task CSV to continue.")
@@ -285,7 +317,7 @@ with st.expander("⚠️ Compliance Issues", expanded=True):
     st.subheader("Overdue Tasks by Store")
     overdue_by_store = task_data[task_data['Is Overdue']].groupby('Store').agg({
         'Task': 'count',
-        'Task category': lambda x: x.mode().iloc[0] if not x.empty else 'Unknown'
+        'Task category': lambda x: x.mode().iloc[0] if not x.empty and not x.isna().all() else 'Unknown'
     }).reset_index().rename(columns={'Task': 'Overdue Tasks'})
     
     if not overdue_by_store.empty:
@@ -308,14 +340,19 @@ with st.expander("⚠️ Compliance Issues", expanded=True):
             if store_kpis is not None and not store_kpis.empty:
                 is_valid, _ = validate_kpi_data(kpi_data)
                 if is_valid:
-                    if store_kpis['Sales vs Target'].iloc[0] < 90:
+                    kpi_row = store_kpis.rename(columns={
+                        'Sales vs Target (%)': 'Sales vs Target',
+                        'CSAT Score': 'CSAT',
+                        'Cleanliness Score': 'Cleanliness Score'
+                    }).iloc[0]
+                    if kpi_row['Sales vs Target'] < 0:
                         st.markdown(f"- {store}: Overdue {row['Task category'].lower()} tasks may be hurting sales "
-                                    f"({store_kpis['Sales vs Target'].iloc[0]}% of target).")
-                    if store_kpis['CSAT'].iloc[0] < 4.0:
-                        st.markdown(f"- {store}: Poor compliance could be impacting CSAT ({store_kpis['CSAT'].iloc[0]}).")
-                    if store_kpis['Shrinkage Rate'].iloc[0] > 2.0:
-                        st.markdown(f"- {store}: Overdue tasks may contribute to high shrinkage "
-                                    f"({store_kpis['Shrinkage Rate'].iloc[0]}%).")
+                                    f"({kpi_row['Sales vs Target']}% of target).")
+                    if kpi_row['CSAT'] < 70:
+                        st.markdown(f"- {store}: Poor compliance could be impacting CSAT ({kpi_row['CSAT']}).")
+                    if kpi_row['Cleanliness Score'] < 70:
+                        st.markdown(f"- {store}: Overdue tasks may contribute to low cleanliness "
+                                    f"({kpi_row['Cleanliness Score']}%).")
     else:
         st.info("No overdue tasks detected.")
 
@@ -373,13 +410,15 @@ with tab1:
                 is_valid, _ = validate_kpi_data(kpi_data)
                 if is_valid:
                     st.markdown("**KPIs**:")
-                    store_kpis = kpi_data[kpi_data['Store'] == store].iloc[0]
+                    store_kpis = kpi_data[kpi_data['Store'] == store].rename(columns={
+                        'Sales vs Target (%)': 'Sales vs Target',
+                        'CSAT Score': 'CSAT',
+                        'Cleanliness Score': 'Cleanliness Score'
+                    }).iloc[0]
                     st.write({
                         'Sales vs Target': f"{store_kpis['Sales vs Target']}%",
                         'CSAT': f"{store_kpis['CSAT']:.1f}",
-                        'Inventory Turnover': f"{store_kpis['Inventory Turnover']:.1f}",
-                        'Shrinkage Rate': f"{store_kpis['Shrinkage Rate']:.1f}%",
-                        'Employee Engagement': f"{store_kpis['Employee Engagement']}%"
+                        'Cleanliness Score': f"{store_kpis['Cleanliness Score']:.1f}"
                     })
 
 with tab2:
@@ -411,5 +450,5 @@ with tab2:
     st.write({
         'Category': task_details['Task category'],
         'Priority': task_details['Priority'],
-        'Assignee': task_details['Assignee']
+        'Assignee': task_details['Assignee'] if pd.notna(task_details['Assignee']) else 'Unassigned'
     })

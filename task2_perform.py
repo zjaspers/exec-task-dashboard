@@ -42,8 +42,8 @@ def find_col(df, *keywords):
     return None
 
 def preprocess(df):
-    end_col = find_col(df, 'end', 'date')
-    comp_col = find_col(df, 'date', 'completed')
+    end_col    = find_col(df, 'end', 'date')
+    comp_col   = find_col(df, 'date', 'completed')
     status_col = find_col(df, 'status')
 
     if end_col:
@@ -105,16 +105,16 @@ if not weeks:
     st.error("No valid 'End date' data found.")
     st.stop()
 
-labels = [f"{w.date()}–{(w + timedelta(days=6)).date()}" for w in weeks]
-sel = st.sidebar.selectbox("Select Week", labels)
-start = weeks[labels.index(sel)]
+labels  = [f"{w.date()}–{(w + timedelta(days=6)).date()}" for w in weeks]
+sel     = st.sidebar.selectbox("Select Week", labels)
+start   = weeks[labels.index(sel)]
 week_df = df[df['Week Start'] == start]
 
-tasks = sorted(week_df['Task name'].unique())
-stores = sorted(week_df['Store'].unique())
-sel_tasks = st.sidebar.multiselect("Filter by Task", tasks, default=tasks)
+tasks    = sorted(week_df['Task name'].unique())
+stores   = sorted(week_df['Store'].unique())
+sel_tasks  = st.sidebar.multiselect("Filter by Task", tasks, default=tasks)
 sel_stores = st.sidebar.multiselect("Filter by Store", stores)
-filtered = week_df[week_df['Task name'].isin(sel_tasks)]
+filtered   = week_df[week_df['Task name'].isin(sel_tasks)]
 if sel_stores:
     filtered = filtered[filtered['Store'].isin(sel_stores)]
 
@@ -136,9 +136,9 @@ with tab1:
     adhoc    = filtered.groupby('Task ID')['Store'].nunique().eq(1).sum()
     avg_csat = filtered['CSAT Score'].mean() if 'CSAT Score' in filtered.columns else None
 
-    prev = df[df['Week Start'] == start - timedelta(weeks=1)]
+    prev    = df[df['Week Start'] == start - timedelta(weeks=1)]
     prev_on = prev.groupby('Task ID')['Days Before Due'].max().ge(0).sum() if not prev.empty else None
-    delta = None if prev_on is None else (on_time - prev_on) / prev_on
+    delta   = None if prev_on is None else (on_time - prev_on) / prev_on
 
     cols = st.columns(6)
     with cols[0]: metric_card("Total Tasks", total)
@@ -152,10 +152,10 @@ with tab1:
     st.markdown("### Top 5 Overdue Tasks")
     over = (
         filtered.groupby('Task ID')
-        .agg(Store=('Store','first'),
-             Task=('Task name','first'),
-             DaysLate=('Days Before Due','max'))
-        .reset_index()
+                .agg(Store=('Store','first'),
+                     Task=('Task name','first'),
+                     DaysLate=('Days Before Due','max'))
+                .reset_index()
     )
     over = over[over['DaysLate'] < 0]
     over['Days Late'] = -over['DaysLate']
@@ -172,12 +172,12 @@ with tab2:
     st.header("Store Health Overview")
     sb = (
         filtered.groupby('Store')
-        .agg(OnTimeRate=('Days Before Due', lambda x: (x>=0).mean()),
-             CSAT=('CSAT Score','mean'),
-             Sales=('Sales vs Target (%)','mean'),
-             TaskLoad=('Task ID','nunique'))
-        .reset_index()
-        .fillna(0)
+                .agg(OnTimeRate=('Days Before Due', lambda x: (x>=0).mean()),
+                     CSAT=('CSAT Score','mean'),
+                     Sales=('Sales vs Target (%)','mean'),
+                     TaskLoad=('Task ID','nunique'))
+                .reset_index()
+                .fillna(0)
     )
     sb['HealthScore'] = (
         sb['OnTimeRate']*0.4 +
@@ -186,7 +186,7 @@ with tab2:
         (1 - sb['TaskLoad']/sb['TaskLoad'].max())*0.1
     )
 
-    # Flatten hierarchy JSON once
+    # Flatten hierarchy JSON
     def flatten(node, path, rows):
         name, typ = node['name'], node['type']
         new_path = path + [name] if typ in ('REGION','COMPANY') else path
@@ -194,8 +194,7 @@ with tab2:
             rows.append({
                 'Store': name,
                 'Division': path[0] if len(path)>0 else 'Unknown',
-                'Region':   path[1] if len(path)>1 else 'Unknown',
-                'Subregion': path[2] if len(path)>2 else 'Unknown'
+                'Region':   path[1] if len(path)>1 else 'Unknown'
             })
         for child in node.get('children', []):
             flatten(child, new_path, rows)
@@ -206,20 +205,19 @@ with tab2:
     flatten(hierarchy, [], rows)
     map_df = pd.DataFrame(rows)
 
-    # Merge and fill unmapped with 'Unknown'
     sb = sb.merge(map_df, on='Store', how='left')
-    sb[['Division','Region','Subregion']] = sb[['Division','Region','Subregion']].fillna('Unknown')
+    sb[['Division','Region']] = sb[['Division','Region']].fillna('Unknown')
 
-    # Treemap
+    # Treemap now uses only Division → Region → Store
     sb['TaskCount'] = sb['TaskLoad']
     fig = px.treemap(
         sb,
-        path=['Division','Region','Subregion','Store'],
+        path=['Division','Region','Store'],
         values='TaskCount',
         color='HealthScore',
         color_continuous_scale='RdYlGn',
         hover_data=['HealthScore'],
-        title='Health by Region → Subregion → Store'
+        title='Health by Region → Store'
     )
     fig.update_layout(margin=dict(t=40,l=0,r=0,b=0))
     st.plotly_chart(fig, use_container_width=True)
@@ -229,22 +227,21 @@ with tab3:
     st.header("Weekly Compliance Trend")
     trend = (
         df.groupby('Week Start')
-        .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max().ge(0).mean())
-        .rename("OnTimeRate")
-        .reset_index()
-        .sort_values('Week Start')
+          .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max().ge(0).mean())
+          .rename("OnTimeRate")
+          .reset_index()
+          .sort_values('Week Start')
     )
     st.line_chart(trend.set_index('Week Start')['OnTimeRate'])
 
     st.subheader("Forecasted On-Time Rate Next Week")
     x = np.arange(len(trend)).reshape(-1,1); y = trend['OnTimeRate']
     if len(trend)>1:
-        model = LinearRegression().fit(x, y)
-        pred = model.predict([[len(trend)]])[0]
+        model = LinearRegression().fit(x, y); pred = model.predict([[len(trend)]])[0]
         st.metric("Forecasted On-Time %", f"{pred:.0%}")
 
     st.subheader("Upcoming Effort Requirement")
-    base_rate = (pred if len(trend)>1 else y.iloc[-1])
+    base_rate = pred if len(trend)>1 else y.iloc[-1]
     fut = (filtered.groupby('Store')['Expected duration'].sum() * (1 - base_rate))
     st.bar_chart(fut.reset_index(name='Required Effort (hrs)').set_index('Store')['Required Effort (hrs)'])
 

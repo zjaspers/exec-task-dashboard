@@ -36,28 +36,22 @@ def load_csv(path):
     return pd.read_csv(path)
 
 def find_col(df, *keywords):
-    """Return first column name containing all keywords (case-insensitive), or None."""
-    cols = df.columns.tolist()
-    for c in cols:
-        cn = c.lower()
-        if all(kw.lower() in cn for kw in keywords):
+    for c in df.columns:
+        if all(kw.lower() in c.lower() for kw in keywords):
             return c
     return None
 
 def preprocess(df):
-    # detect the columns
     end_col = find_col(df, 'end', 'date')
     comp_col = find_col(df, 'date', 'completed')
-    task_status_col = find_col(df, 'status')  # e.g. "Task status"
+    status_col = find_col(df, 'status')
 
-    # parse dates if present
     if end_col:
         df[end_col] = pd.to_datetime(df[end_col], errors='coerce')
     if comp_col:
         df[comp_col] = pd.to_datetime(df[comp_col], errors='coerce')
 
     today = pd.Timestamp.now().normalize()
-    # calculate days before due
     if end_col and comp_col:
         df['Days Before Due'] = (df[end_col] - df[comp_col]).dt.days
         missing = df[comp_col].isna() & df[end_col].notna()
@@ -65,20 +59,15 @@ def preprocess(df):
     else:
         df['Days Before Due'] = np.nan
 
-    # overdue flag
-    if end_col and task_status_col:
-        df['Overdue'] = (df[end_col] < pd.Timestamp.now()) & (df[task_status_col].str.lower() != 'completed')
+    if end_col and status_col:
+        df['Overdue'] = (df[end_col] < pd.Timestamp.now()) & (df[status_col].str.lower() != 'completed')
     else:
         df['Overdue'] = False
 
-    # store & region
     df['Region'] = df.get('Level 1', pd.Series()).fillna('Unknown')
-    df['Store']  = df.get('Location name', pd.Series())
-
-    # filter out company/regional placeholders
+    df['Store']  = df.get('Location name', pd.Series()).fillna('Unknown')
     df = df[~df['Store'].isin(['JameTrade','Midwest'])]
 
-    # week start
     if end_col:
         df['Week Start'] = df[end_col].dt.to_period('W').apply(lambda r: r.start_time)
     else:
@@ -99,7 +88,6 @@ def metric_card(label, value, delta=None):
 st.sidebar.header("Data & Filters")
 task_file = st.sidebar.file_uploader("➕ Task CSV", type="csv")
 kpi_file  = st.sidebar.file_uploader("📊 Store KPI CSV (optional)", type="csv")
-
 if not task_file:
     st.sidebar.info("Upload Task CSV to begin.")
     st.stop()
@@ -107,24 +95,25 @@ if not task_file:
 # ─── Load & Prepare Data ─────────────────────────────────────────────
 df = load_csv(task_file)
 df = preprocess(df)
-
-# merge KPI only if provided
 if kpi_file:
     df_kpi = load_csv(kpi_file).rename(columns={'Location ID':'Location external ID'})
     df = df.merge(df_kpi, on=['Location external ID','Store'], how='left')
 
 # ─── Week Selector & Filters ─────────────────────────────────────────
-weeks  = sorted(df['Week Start'].dropna().unique(), reverse=True)
+weeks = sorted(df['Week Start'].dropna().unique(), reverse=True)
+if not weeks:
+    st.error("No valid 'End date' data found.")
+    st.stop()
+
 labels = [f"{w.date()}–{(w + timedelta(days=6)).date()}" for w in weeks]
-sel    = st.sidebar.selectbox("Select Week", labels)
-start  = weeks[labels.index(sel)]
-week_df= df[df['Week Start']==start]
+sel = st.sidebar.selectbox("Select Week", labels)
+start = weeks[labels.index(sel)]
+week_df = df[df['Week Start'] == start]
 
-tasks  = sorted(week_df['Task name'].unique())
-stores = sorted(week_df['Store'].dropna().unique())
-sel_tasks  = st.sidebar.multiselect("Filter by Task", tasks, default=tasks)
+tasks = sorted(week_df['Task name'].unique())
+stores = sorted(week_df['Store'].unique())
+sel_tasks = st.sidebar.multiselect("Filter by Task", tasks, default=tasks)
 sel_stores = st.sidebar.multiselect("Filter by Store", stores)
-
 filtered = week_df[week_df['Task name'].isin(sel_tasks)]
 if sel_stores:
     filtered = filtered[filtered['Store'].isin(sel_stores)]
@@ -145,11 +134,11 @@ with tab1:
     avg_days = filtered.groupby('Task ID')['Days Before Due'].mean().mean().round(1)
     overdue  = total - on_time
     adhoc    = filtered.groupby('Task ID')['Store'].nunique().eq(1).sum()
-    avg_csat = filtered.get('CSAT Score').mean() if 'CSAT Score' in filtered else None
+    avg_csat = filtered['CSAT Score'].mean() if 'CSAT Score' in filtered.columns else None
 
-    prev     = df[df['Week Start']== start - timedelta(weeks=1)]
-    prev_on  = prev.groupby('Task ID')['Days Before Due'].max().ge(0).sum() if not prev.empty else None
-    delta    = None if prev_on is None else (on_time - prev_on)/prev_on
+    prev = df[df['Week Start'] == start - timedelta(weeks=1)]
+    prev_on = prev.groupby('Task ID')['Days Before Due'].max().ge(0).sum() if not prev.empty else None
+    delta = None if prev_on is None else (on_time - prev_on) / prev_on
 
     cols = st.columns(6)
     with cols[0]: metric_card("Total Tasks", total)
@@ -161,12 +150,14 @@ with tab1:
         with cols[5]: metric_card("Avg CSAT", f"{avg_csat:.1f}")
 
     st.markdown("### Top 5 Overdue Tasks")
-    over = (filtered.groupby('Task ID')
-                .agg(Store=('Store','first'),
-                     Task=('Task name','first'),
-                     DaysLate=('Days Before Due','max'))
-                .reset_index())
-    over = over[over['DaysLate']<0]
+    over = (
+        filtered.groupby('Task ID')
+        .agg(Store=('Store','first'),
+             Task=('Task name','first'),
+             DaysLate=('Days Before Due','max'))
+        .reset_index()
+    )
+    over = over[over['DaysLate'] < 0]
     over['Days Late'] = -over['DaysLate']
     st.table(over[['Store','Task ID','Task','Days Late']]
              .sort_values('Days Late', ascending=False).head(5))
@@ -179,13 +170,15 @@ with tab1:
 # ─── Tab 2: Store Health Overview with Treemap ───────────────────────
 with tab2:
     st.header("Store Health Overview")
-    sb = (filtered.groupby('Store')
-              .agg(OnTimeRate=('Days Before Due', lambda x: (x>=0).mean()),
-                   CSAT=('CSAT Score','mean'),
-                   Sales=('Sales vs Target (%)','mean'),
-                   TaskLoad=('Task ID','nunique'))
-              .reset_index()
-              .fillna(0))
+    sb = (
+        filtered.groupby('Store')
+        .agg(OnTimeRate=('Days Before Due', lambda x: (x>=0).mean()),
+             CSAT=('CSAT Score','mean'),
+             Sales=('Sales vs Target (%)','mean'),
+             TaskLoad=('Task ID','nunique'))
+        .reset_index()
+        .fillna(0)
+    )
     sb['HealthScore'] = (
         sb['OnTimeRate']*0.4 +
         (sb['CSAT']/100)*0.3 +
@@ -193,25 +186,29 @@ with tab2:
         (1 - sb['TaskLoad']/sb['TaskLoad'].max())*0.1
     )
 
-    # Flatten hierarchy JSON
+    # Flatten hierarchy JSON once
     def flatten(node, path, rows):
         name, typ = node['name'], node['type']
         new_path = path + [name] if typ in ('REGION','COMPANY') else path
         if typ == 'STORE':
             rows.append({
                 'Store': name,
-                'Division': path[0] if len(path)>0 else None,
-                'Region':   path[1] if len(path)>1 else None,
-                'Subregion': path[2] if len(path)>2 else None
+                'Division': path[0] if len(path)>0 else 'Unknown',
+                'Region':   path[1] if len(path)>1 else 'Unknown',
+                'Subregion': path[2] if len(path)>2 else 'Unknown'
             })
         for child in node.get('children', []):
             flatten(child, new_path, rows)
 
     with open('region_hierarchy.json') as f:
         hierarchy = json.load(f)
-    rows = []; flatten(hierarchy, [], rows)
+    rows = []
+    flatten(hierarchy, [], rows)
     map_df = pd.DataFrame(rows)
+
+    # Merge and fill unmapped with 'Unknown'
     sb = sb.merge(map_df, on='Store', how='left')
+    sb[['Division','Region','Subregion']] = sb[['Division','Region','Subregion']].fillna('Unknown')
 
     # Treemap
     sb['TaskCount'] = sb['TaskLoad']
@@ -230,23 +227,25 @@ with tab2:
 # ─── Tab 3: Trends & Forecast ────────────────────────────────────────
 with tab3:
     st.header("Weekly Compliance Trend")
-    trend = (df.groupby('Week Start')
-               .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max()
-                      .ge(0).mean())
-               .rename("OnTimeRate")
-               .reset_index()
-             ).sort_values('Week Start')
+    trend = (
+        df.groupby('Week Start')
+        .apply(lambda d: d.groupby('Task ID')['Days Before Due'].max().ge(0).mean())
+        .rename("OnTimeRate")
+        .reset_index()
+        .sort_values('Week Start')
+    )
     st.line_chart(trend.set_index('Week Start')['OnTimeRate'])
 
     st.subheader("Forecasted On-Time Rate Next Week")
     x = np.arange(len(trend)).reshape(-1,1); y = trend['OnTimeRate']
     if len(trend)>1:
-        model = LinearRegression().fit(x,y); pred = model.predict([[len(trend)]])[0]
+        model = LinearRegression().fit(x, y)
+        pred = model.predict([[len(trend)]])[0]
         st.metric("Forecasted On-Time %", f"{pred:.0%}")
 
     st.subheader("Upcoming Effort Requirement")
-    fut = (filtered.groupby('Store')['Expected duration'].sum()
-           * (1 - (pred if len(trend)>1 else y.iloc[-1])))
+    base_rate = (pred if len(trend)>1 else y.iloc[-1])
+    fut = (filtered.groupby('Store')['Expected duration'].sum() * (1 - base_rate))
     st.bar_chart(fut.reset_index(name='Required Effort (hrs)').set_index('Store')['Required Effort (hrs)'])
 
 # ─── Tab 4: Action & Accountability Tracker ─────────────────────────
